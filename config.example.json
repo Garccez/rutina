@@ -1,0 +1,52 @@
+{
+    "environment": {
+	"app": "UFSMDigital",
+	"device_info": "Apple iPhone ios:15.7.3",
+	"message_token": "c7ptbA7De0nvnvagiGEgbC:APA91bE1AABlRKEjUB_HCB_yVKmocYxOgym2ebWlpP6hCjMYpTcgiTMiKTu7KZgTMLIrv55SieM0fLqWBIiMLULrwTDISoszte9zMAVaMfQqt9cxAHaxJ47moYT628v9JMBQftaLVxKm"
+    },
+    "behaviour": {
+	"use_monday_schedule_on_friday": false
+    },
+    "schedules": [
+	{
+	    "weekday": "mon",
+	    "restaurant": 2,
+	    "vegetarian": false,
+	    "coffee": false,
+	    "lunch": true,
+	    "dinner": false
+	},
+	{
+	    "weekday": "tue",
+	    "restaurant": 2,
+	    "vegetarian": false,
+	    "coffee": false,
+	    "lunch": true,
+	    "dinner": false
+	},
+	{
+	    "weekday": "wed",
+	    "restaurant": 1,
+	    "vegetarian": false,
+	    "coffee": true,
+	    "lunch": false,
+	    "dinner": false
+	},
+	{
+	    "weekday": "thu",
+	    "restaurant": 1,
+	    "vegetarian": false,
+	    "coffee": true,
+	    "lunch": false,
+	    "dinner": false
+	},
+	{
+	    "weekday": "fri",
+	    "restaurant": 2,
+	    "vegetarian": false,
+	    "coffee": false,
+	    "lunch": true,
+	    "dinner": false
+	}
+    ]
+}
