@@ -2,6 +2,7 @@ const std = @import("std");
 const linux = std.os.linux;
 
 const utc_offset_seconds = 3 * 3600;
+const base_url = "https://portal.ufsm.br/mobile/webservice/flutter/";
 
 const Config = struct {
     environment: Environment,
@@ -28,9 +29,20 @@ const Weekday = enum {
     sat,
     sun,
 };
+const Restaurant = enum(u8) {
+    ru1 = 1,
+    ru2 = 2,
+
+    fn apiId(self: Restaurant) u8 {
+        return switch (self) {
+            .ru1 => 1,
+            .ru2 => 41,
+        };
+    }
+};
 const Schedule = struct {
     weekday: Weekday,
-    restaurant: u8,
+    restaurant: Restaurant,
     vegetarian: bool = false,
     coffee: bool = false,
     lunch: bool = false,
@@ -81,54 +93,18 @@ const ScheduleBody = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    // Initiates the arena allocator
     const arena: std.mem.Allocator = init.arena.allocator();
-    // Get system io
+    // Gets system io
     const io = init.io;
-    const args = try init.minimal.args.toSlice(arena);
 
-    const student_login = parseStudentFromArgs(args) catch |err| switch (err) {
-        error.MissingUsernameValue => {
-            std.debug.print("ERRO: É necessário fornecer um valor para matrícula.\n", .{});
-            std.process.exit(1);
-        },
-        error.MissingPasswordValue => {
-            std.debug.print("ERRO: É necessário fornecer um valor para senha.\n", .{});
-            std.process.exit(1);
-        },
-        error.UnknownArgument => {
-            std.debug.print("ERRO: Argumento ou opção desconhecida.\nUtilize -u/--username e -p/--password para fornecer matrícula e senha.\n", .{});
-            std.process.exit(1);
-        },
-    };
+    // Loads student login from args and env, then checks if a password was provided.
+    // If it was not, it asks the user to provide one secretly from the terminal.
+    const final_student_login: Login = loadLogin(init, io, arena);
 
-    const student_id_env = init.environ_map.get("RUTINA_USERNAME");
-    const password_env = init.environ_map.get("RUTINA_PASSWORD");
-
-    var final_student_login: Login = parseEnvWithArgs(student_login, student_id_env, password_env) catch |err| switch (err) {
-        error.MissingUsername => {
-            std.debug.print("ERRO: É necessário fornecer uma matrícula.\n", .{});
-            std.process.exit(1);
-        },
-    };
-
-    if (final_student_login.password == null) {
-        final_student_login.password = promptPassword(arena, io) catch |err| {
-            std.debug.print("ERRO: Algo deu errado. ({s})\n", .{@errorName(err)});
-            std.process.exit(1);
-        };
-    }
-
-    const input = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, "config.json", arena, .limited(64 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => {
-            std.debug.print("ERRO: Arquivo 'config.json' não existe.\n", .{});
-            std.process.exit(1);
-        },
-        else => return err,
-    };
-    const parsed_json = parseJson(input, arena) catch |err| {
-        std.debug.print("ERRO: O 'config.json' não é válido. ({s})\n", .{@errorName(err)});
-        std.process.exit(1);
-    };
+    // Parses the provided "config.json" into a Config (struct), expects it to be
+    // correct JSON syntax.
+    const parsed_json = loadConfig(io, arena);
 
     // Get current moment since Jan 1, 1970 in nanosseconds,
     // and then convert it to the enum weekday through weekdayFromSeconds.
@@ -148,13 +124,11 @@ pub fn main(init: std.process.Init) !void {
     defer client.deinit();
     const token = httpFetchToken(io, &client, arena, parsed_json, final_student_login) catch |err| switch (err) {
         error.NoAccessToken => {
-            std.debug.print("ERRO: Não foi possível obter o token de acesso.\n", .{});
-            std.process.exit(1);
+            fatal("Não foi possível obter o token de acesso.", .{});
         },
-        error.HttpError => std.process.exit(1),
+        error.HttpError, error.LoginRefused => std.process.exit(1),
         else => {
-            std.debug.print("ERRO: Algo deu errado. ({s})\n", .{@errorName(err)});
-            std.process.exit(1);
+            fatal("Algo deu errado. ({s})", .{@errorName(err)});
         },
     };
 
@@ -169,16 +143,16 @@ pub fn main(init: std.process.Init) !void {
             tried_schedule += 1;
             doSchedule(&client, arena, s, token, date) catch |err| switch (err) {
                 error.FailedSchedule => {
-                    std.debug.print("ERRO: Um ou mais agendamentos falharam.\n", .{});
+                    logError("Um ou mais agendamentos falharam.", .{});
                     failed = true;
                 },
                 error.HttpError, error.ScheduleRefused => failed = true,
                 error.NoMealList => {
-                    std.debug.print("ERRO: RU {d}: a API não retornou a lista de refeições.\n", .{s.restaurant});
+                    logError("RU {d}: a API não retornou a lista de refeições.", .{@backingInt(s.restaurant)});
                     failed = true;
                 },
                 else => {
-                    std.debug.print("ERRO: RU {d}: algo deu errado. ({s})\n", .{ s.restaurant, @errorName(err) });
+                    logError("RU {d}: algo deu errado. ({s})", .{ @backingInt(s.restaurant), @errorName(err) });
                     failed = true;
                 },
             };
@@ -186,6 +160,57 @@ pub fn main(init: std.process.Init) !void {
     }
 
     if (failed) std.process.exit(1);
+}
+
+fn logError(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print("[ERRO] " ++ fmt ++ "\n", args);
+}
+
+fn loadConfig(io: std.Io, arena: std.mem.Allocator) Config {
+    // Tries to read "config.json" from the folder the executable is being run inside.
+    // Otherwise throws an error.
+    const input = std.Io.Dir.readFileAlloc(std.Io.Dir.cwd(), io, "config.json", arena, .limited(64 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => fatal("Arquivo 'config.json' não existe.", .{}),
+        else => fatal("Algo deu errado. ({s})", .{@errorName(err)}),
+    };
+    // Parses the provided "config.json" into a Config (struct), expects it to be
+    // correct JSON syntax.
+    const parsed_json = parseJson(input, arena) catch |err| {
+        fatal("O \"config.json\" não é válido. ({s})", .{@errorName(err)});
+    };
+    return parsed_json;
+}
+
+fn loadLogin(init: std.process.Init, io: std.Io, arena: std.mem.Allocator) Login {
+    // Tries to load the commandline arguments into the args slice, otherwise returns a fatal error.
+    const args = init.minimal.args.toSlice(arena) catch |err| switch (err) {
+        error.OutOfMemory => fatal("O aplicativo ficou sem memória para concluir esta operação.", .{}),
+        error.Unexpected => fatal("Algo inesperado ocorreu.", .{}),
+    };
+
+    // Then tries to parse the student login information from the arguments with parseStudentFromArgs.
+    const student_login = parseStudentFromArgs(args) catch |err| switch (err) {
+        error.MissingUsernameValue => fatal("É necessário fornecer um valor para matrícula.", .{}),
+        error.MissingPasswordValue => fatal("É necessário fornecer um valor para senha.", .{}),
+        error.UnknownArgument => fatal("Argumento ou opção desconhecida.\nUtilize -u/--username e -p/--password para fornecer matrícula e senha.", .{}),
+    };
+    // Loads login information environment variables
+    const student_id_env = init.environ_map.get("RUTINA_USERNAME");
+    const password_env = init.environ_map.get("RUTINA_PASSWORD");
+
+    // Then tries to parse those same variables into the final Login (struct), if both the arguments'
+    // and environment's username is null, returns an error.
+    var final_login: Login = parseEnvWithArgs(student_login, student_id_env, password_env) catch |err| switch (err) {
+        error.MissingUsername => fatal("É necessário fornecer uma matrícula.", .{}),
+    };
+
+    if (final_login.password == null) {
+        final_login.password = promptPassword(arena, io) catch |err| {
+            fatal("Algo deu errado. ({s})", .{@errorName(err)});
+        };
+    }
+
+    return final_login;
 }
 
 fn hasScheduleFor(target: Weekday, schedules: []const Schedule) bool {
@@ -213,28 +238,9 @@ fn tomorrowFromWeekday(weekday: Weekday) Weekday {
 }
 
 fn targetWeekday(today: Weekday, schedules: []const Schedule, rule: bool) Weekday {
-    var has_weekend = false;
-    if (today == Weekday.fri) {
-        for (schedules) |s| {
-            if (s.weekday == Weekday.sat or s.weekday == Weekday.sun) {
-                has_weekend = true;
-            }
-        }
-        if (has_weekend) {
-            return Weekday.sat;
-        }
-        if (rule) {
-            return Weekday.mon;
-        }
-    }
+    const weekend = hasScheduleFor(.sat, schedules) or hasScheduleFor(.sun, schedules);
+    if (today == .fri and rule and !weekend) return .mon;
     return tomorrowFromWeekday(today);
-}
-
-fn restaurantRealNumber(restaurant: u8) u8 {
-    return switch (restaurant) {
-        2 => 41,
-        else => 1,
-    };
 }
 
 fn parseStudentFromArgs(args: []const [:0]const u8) !Login {
@@ -281,13 +287,13 @@ fn promptPassword(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
 
     var hidden = true;
     setEcho(false) catch {
-        hidden = false; // stdin não é um terminal (pipe): lê normalmente
+        hidden = false;
     };
     defer {
         if (hidden) setEcho(true) catch {};
     }
 
-    std.debug.print("Senha UFSM: ", .{});
+    std.debug.print("[RUTINA] Senha UFSM: ", .{});
     const line = try stdin.takeDelimiterExclusive('\n');
     if (hidden) std.debug.print("\n", .{});
 
@@ -297,7 +303,7 @@ fn promptPassword(allocator: std.mem.Allocator, io: std.Io) ![]const u8 {
 fn checkStatus(status: std.http.Status) !void {
     const code = @backingInt(status);
     if (code >= 400) {
-        std.debug.print("ERRO: O Portal UFSM respondeu com status {d}.\n", .{code});
+        logError("O Portal UFSM respondeu com status {d}.", .{code});
         return error.HttpError;
     }
 }
@@ -311,39 +317,53 @@ fn setEcho(enabled: bool) !void {
     if (linux.errno(linux.ioctl(0, linux.T.CSETS, @intFromPtr(&term))) != .SUCCESS) return error.TerminalFailed;
 }
 
-fn httpFetchToken(io: std.Io, client: *std.http.Client, arena: std.mem.Allocator, config: Config, login: Login) ![]const u8 {
+fn postJson(
+    comptime Response: type,
+    client: *std.http.Client,
+    arena: std.mem.Allocator,
+    url: []const u8,
+    request: anytype,
+    extra_headers: []const std.http.Header,
+) !Response {
     var body: std.Io.Writer.Allocating = .init(arena);
+    const payload = try std.json.Stringify.valueAlloc(arena, request, .{});
 
+    const result = try client.fetch(.{
+        .method = .POST,
+        .location = .{ .url = url },
+        .payload = payload,
+        .headers = .{ .content_type = .{ .override = "application/json" } },
+        .extra_headers = extra_headers,
+        .response_writer = &body.writer,
+    });
+    try checkStatus(result.status);
+    const parsed = try std.json.parseFromSlice(Response, arena, body.written(), .{ .ignore_unknown_fields = true });
+
+    return parsed.value;
+}
+
+fn httpFetchToken(
+    io: std.Io,
+    client: *std.http.Client,
+    arena: std.mem.Allocator,
+    config: Config,
+    login: Login,
+) ![]const u8 {
     var raw: [16]u8 = undefined;
     io.random(&raw);
     const device_id = try formatUuid(arena, raw);
 
     const body_struct = LoginBody{ .appName = config.environment.app, .deviceId = device_id, .deviceInfo = config.environment.device_info, .messageToken = config.environment.message_token, .login = login.student_id.?, .senha = login.password.? };
-    const json_text = try std.json.Stringify.valueAlloc(arena, body_struct, .{});
+    const login_url: []const u8 = base_url ++ "generateTokenJwt";
 
-    const result = try client.fetch(.{
-        .method = .POST,
-        .location = .{ .url = "https://portal.ufsm.br/mobile/webservice/flutter/generateTokenJwt" },
-        .payload = json_text,
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-        .response_writer = &body.writer,
-    });
-    try checkStatus(result.status);
+    const response = try postJson(LoginResponse, client, arena, login_url, body_struct, &.{});
 
-    const parsed = try std.json.parseFromSlice(
-        LoginResponse,
-        arena,
-        body.written(),
-        .{ .ignore_unknown_fields = true },
-    );
-    const resposta = parsed.value;
-
-    if (resposta.@"error") {
-        std.debug.print("ERRO: {s}\n", .{resposta.mensagem orelse "A API recusou o login."});
-        std.process.exit(1);
+    if (response.@"error") {
+        logError("{s}", .{response.mensagem orelse "A API recusou o login."});
+        return error.LoginRefused;
     }
-    const resposta_body = resposta.body orelse return error.NoAccessToken;
-    const token = resposta_body.accessToken orelse return error.NoAccessToken;
+    const response_body = response.body orelse return error.NoAccessToken;
+    const token = response_body.accessToken orelse return error.NoAccessToken;
     return token;
 }
 
@@ -367,33 +387,33 @@ fn foodType(arena: std.mem.Allocator, schedule: Schedule) ![]u4 {
         @as(usize, @intFromBool(schedule.lunch)) +
         @as(usize, @intFromBool(schedule.dinner));
 
-    const lista = try arena.alloc(u4, n);
+    const list = try arena.alloc(u4, n);
     var i: usize = 0;
 
     if (schedule.coffee) {
-        lista[i] = 1;
+        list[i] = 1;
         i += 1;
     }
     if (schedule.lunch) {
-        lista[i] = 2;
+        list[i] = 2;
         i += 1;
     }
     if (schedule.dinner) {
-        lista[i] = 3;
+        list[i] = 3;
         i += 1;
     }
 
-    return lista;
+    return list;
 }
 
-/// Quantos dias faltam de `today` até `target` (sempre de 1 a 6).
+/// How many days there are from `today` until `target` (always 1 to 6).
 fn daysUntil(today: Weekday, target: Weekday) u8 {
     const t: u3 = @backingInt(today);
     const g: u3 = @backingInt(target);
     return (@as(u8, g) + 7 - t) % 7;
 }
 
-/// Data daqui a `days_ahead` dias (horário UTC-3), no formato da API.
+/// Date `days_ahead` days from now (UTC-3 timezone), in the API format.
 fn dateString(arena: std.mem.Allocator, now_seconds: i64, days_ahead: u8) ![]u8 {
     const local = now_seconds - utc_offset_seconds + @as(i64, days_ahead) * 86400;
 
@@ -409,46 +429,30 @@ fn dateString(arena: std.mem.Allocator, now_seconds: i64, days_ahead: u8) ![]u8 
 }
 
 fn doSchedule(client: *std.http.Client, arena: std.mem.Allocator, schedule: Schedule, token: []const u8, date: []const u8) !void {
-    var schedule_body: std.Io.Writer.Allocating = .init(arena);
-
-    const schedule_body_struct = ScheduleBody{ .dataInicio = date, .dataFim = date, .idRestaurante = restaurantRealNumber(schedule.restaurant), .opcaoVegetariana = schedule.vegetarian, .tiposRefeicoes = try foodType(arena, schedule) };
-    const schedule_json_text = try std.json.Stringify.valueAlloc(arena, schedule_body_struct, .{});
+    const schedule_body_struct = ScheduleBody{ .dataInicio = date, .dataFim = date, .idRestaurante = schedule.restaurant.apiId(), .opcaoVegetariana = schedule.vegetarian, .tiposRefeicoes = try foodType(arena, schedule) };
     const auth_value = try std.fmt.allocPrint(arena, "Bearer {s}", .{token});
+    const schedule_url: []const u8 = base_url ++ "ru/agendaRefeicoes";
 
-    const result = try client.fetch(.{
-        .method = .POST,
-        .location = .{ .url = "https://portal.ufsm.br/mobile/webservice/flutter/ru/agendaRefeicoes" },
-        .payload = schedule_json_text,
-        .headers = .{ .content_type = .{ .override = "application/json" } },
-        .extra_headers = &.{.{ .name = "Authorization", .value = auth_value }},
-        .response_writer = &schedule_body.writer,
+    const schedule_response = try postJson(ScheduleResponse, client, arena, schedule_url, schedule_body_struct, &.{
+        .{ .name = "Authorization", .value = auth_value },
     });
-    try checkStatus(result.status);
 
-    const schedule_parsed = try std.json.parseFromSlice(
-        ScheduleResponse,
-        arena,
-        schedule_body.written(),
-        .{ .ignore_unknown_fields = true },
-    );
-    const schedule_resposta = schedule_parsed.value;
-
-    if (schedule_resposta.@"error") {
-        std.debug.print("ERRO: RU {d}: {s}\n", .{ schedule.restaurant, schedule_resposta.mensagem orelse "A API recusou o agendamento." });
+    if (schedule_response.@"error") {
+        logError("RU {d}: {s}", .{ schedule.restaurant, schedule_response.mensagem orelse "A API recusou o agendamento." });
         return error.ScheduleRefused;
     }
 
-    const itens = schedule_resposta.body orelse return error.NoMealList;
+    const items = schedule_response.body orelse return error.NoMealList;
 
     var failed = false;
-    for (itens) |item| {
-        const refeicao = if (item.tipoRefeicao) |t| t.descricao orelse "refeição" else "refeição";
+    for (items) |item| {
+        const meal = if (item.tipoRefeicao) |t| t.descricao orelse "refeição" else "refeição";
         const data = item.dataRefAgendada orelse "data desconhecida";
 
         if (item.sucesso) {
-            std.debug.print("{s} ({s}): Agendado com sucesso.\n", .{ data, refeicao });
+            std.debug.print("{s} ({s}): Agendado com sucesso.\n", .{ data, meal });
         } else {
-            std.debug.print("[Erro] {s} ({s}): {s}\n", .{ data, refeicao, item.impedimento orelse "resposta sem motivo" });
+            logError("{s} ({s}): {s}", .{ data, meal, item.impedimento orelse "resposta sem motivo" });
             failed = true;
         }
     }
@@ -474,34 +478,39 @@ fn expectFoodType(expected: []const u4, schedule: Schedule) !void {
     try std.testing.expectEqualSlices(u4, expected, result);
 }
 
+fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print("[ERRO] " ++ fmt ++ "\n", args);
+    std.process.exit(1);
+}
+
 // ---------- foodType ----------
 
 test "food type: only coffee" {
-    try expectFoodType(&.{1}, .{ .weekday = .mon, .restaurant = 1, .coffee = true });
+    try expectFoodType(&.{1}, .{ .weekday = .mon, .restaurant = .ru1, .coffee = true });
 }
 
 test "food type: only lunch" {
-    try expectFoodType(&.{2}, .{ .weekday = .mon, .restaurant = 1, .lunch = true });
+    try expectFoodType(&.{2}, .{ .weekday = .mon, .restaurant = .ru1, .lunch = true });
 }
 
 test "food type: only dinner" {
-    try expectFoodType(&.{3}, .{ .weekday = .mon, .restaurant = 1, .dinner = true });
+    try expectFoodType(&.{3}, .{ .weekday = .mon, .restaurant = .ru1, .dinner = true });
 }
 
 test "food type: coffee and dinner" {
-    try expectFoodType(&.{ 1, 3 }, .{ .weekday = .mon, .restaurant = 1, .coffee = true, .dinner = true });
+    try expectFoodType(&.{ 1, 3 }, .{ .weekday = .mon, .restaurant = .ru1, .coffee = true, .dinner = true });
 }
 
 test "food type: coffee and lunch" {
-    try expectFoodType(&.{ 1, 2 }, .{ .weekday = .mon, .restaurant = 1, .coffee = true, .lunch = true });
+    try expectFoodType(&.{ 1, 2 }, .{ .weekday = .mon, .restaurant = .ru1, .coffee = true, .lunch = true });
 }
 
 test "food type: all three" {
-    try expectFoodType(&.{ 1, 2, 3 }, .{ .weekday = .mon, .restaurant = 1, .coffee = true, .lunch = true, .dinner = true });
+    try expectFoodType(&.{ 1, 2, 3 }, .{ .weekday = .mon, .restaurant = .ru1, .coffee = true, .lunch = true, .dinner = true });
 }
 
 test "food type: none" {
-    try expectFoodType(&.{}, .{ .weekday = .mon, .restaurant = 1 });
+    try expectFoodType(&.{}, .{ .weekday = .mon, .restaurant = .ru1 });
 }
 
 // ---------- daysUntil ----------
@@ -565,16 +574,16 @@ test "date string: UTC already tomorrow, Brazil still today" {
 
 test "has schedule for: day present" {
     const schedules = [_]Schedule{
-        .{ .weekday = .mon, .restaurant = 1, .lunch = true },
-        .{ .weekday = .wed, .restaurant = 2, .coffee = true },
+        .{ .weekday = .mon, .restaurant = .ru1, .lunch = true },
+        .{ .weekday = .wed, .restaurant = .ru2, .coffee = true },
     };
     try std.testing.expect(hasScheduleFor(.wed, &schedules));
 }
 
 test "has schedule for: day absent" {
     const schedules = [_]Schedule{
-        .{ .weekday = .mon, .restaurant = 1, .lunch = true },
-        .{ .weekday = .wed, .restaurant = 2, .coffee = true },
+        .{ .weekday = .mon, .restaurant = .ru1, .lunch = true },
+        .{ .weekday = .wed, .restaurant = .ru2, .coffee = true },
     };
     try std.testing.expect(!hasScheduleFor(.tue, &schedules));
 }
@@ -613,10 +622,10 @@ test "time conversion, tomorrow: Saturday -> Sunday" {
 
 test "friday check: no weekend" {
     const schedules = [_]Schedule{
-        .{ .weekday = .mon, .restaurant = 1, .lunch = true },
-        .{ .weekday = .thu, .restaurant = 2, .coffee = true, .lunch = true },
-        .{ .weekday = .fri, .restaurant = 1, .coffee = true, .dinner = true },
-        .{ .weekday = .mon, .restaurant = 2, .coffee = true, .dinner = true },
+        .{ .weekday = .mon, .restaurant = .ru1, .lunch = true },
+        .{ .weekday = .thu, .restaurant = .ru2, .coffee = true, .lunch = true },
+        .{ .weekday = .fri, .restaurant = .ru1, .coffee = true, .dinner = true },
+        .{ .weekday = .mon, .restaurant = .ru2, .coffee = true, .dinner = true },
     };
 
     try std.testing.expectEqual(Weekday.mon, targetWeekday(Weekday.fri, &schedules, true));
@@ -624,10 +633,10 @@ test "friday check: no weekend" {
 
 test "friday check: schedule contains saturday" {
     const schedules = [_]Schedule{
-        .{ .weekday = .mon, .restaurant = 1, .lunch = true },
-        .{ .weekday = .thu, .restaurant = 2, .coffee = true, .lunch = true },
-        .{ .weekday = .fri, .restaurant = 1, .coffee = true, .dinner = true },
-        .{ .weekday = .sat, .restaurant = 2, .coffee = true, .dinner = true },
+        .{ .weekday = .mon, .restaurant = .ru1, .lunch = true },
+        .{ .weekday = .thu, .restaurant = .ru2, .coffee = true, .lunch = true },
+        .{ .weekday = .fri, .restaurant = .ru1, .coffee = true, .dinner = true },
+        .{ .weekday = .sat, .restaurant = .ru2, .coffee = true, .dinner = true },
     };
 
     try std.testing.expectEqual(Weekday.sat, targetWeekday(Weekday.fri, &schedules, true));
@@ -635,10 +644,10 @@ test "friday check: schedule contains saturday" {
 
 test "friday check: schedule contains sunday" {
     const schedules = [_]Schedule{
-        .{ .weekday = .mon, .restaurant = 1, .lunch = true },
-        .{ .weekday = .thu, .restaurant = 2, .coffee = true, .lunch = true },
-        .{ .weekday = .fri, .restaurant = 1, .coffee = true, .dinner = true },
-        .{ .weekday = .sun, .restaurant = 2, .coffee = true, .dinner = true },
+        .{ .weekday = .mon, .restaurant = .ru1, .lunch = true },
+        .{ .weekday = .thu, .restaurant = .ru2, .coffee = true, .lunch = true },
+        .{ .weekday = .fri, .restaurant = .ru1, .coffee = true, .dinner = true },
+        .{ .weekday = .sun, .restaurant = .ru2, .coffee = true, .dinner = true },
     };
 
     try std.testing.expectEqual(Weekday.sat, targetWeekday(Weekday.fri, &schedules, true));
@@ -646,10 +655,10 @@ test "friday check: schedule contains sunday" {
 
 test "friday check: schedule contains both saturday and sunday" {
     const schedules = [_]Schedule{
-        .{ .weekday = .mon, .restaurant = 1, .lunch = true },
-        .{ .weekday = .sat, .restaurant = 2, .coffee = true, .lunch = true },
-        .{ .weekday = .fri, .restaurant = 1, .coffee = true, .dinner = true },
-        .{ .weekday = .sun, .restaurant = 2, .coffee = true, .dinner = true },
+        .{ .weekday = .mon, .restaurant = .ru1, .lunch = true },
+        .{ .weekday = .sat, .restaurant = .ru2, .coffee = true, .lunch = true },
+        .{ .weekday = .fri, .restaurant = .ru1, .coffee = true, .dinner = true },
+        .{ .weekday = .sun, .restaurant = .ru2, .coffee = true, .dinner = true },
     };
 
     try std.testing.expectEqual(Weekday.sat, targetWeekday(Weekday.fri, &schedules, true));
@@ -657,25 +666,13 @@ test "friday check: schedule contains both saturday and sunday" {
 
 test "friday check: not friday" {
     const schedules = [_]Schedule{
-        .{ .weekday = .mon, .restaurant = 1, .lunch = true },
-        .{ .weekday = .thu, .restaurant = 2, .coffee = true, .lunch = true },
-        .{ .weekday = .fri, .restaurant = 1, .coffee = true, .dinner = true },
-        .{ .weekday = .sun, .restaurant = 2, .coffee = true, .dinner = true },
+        .{ .weekday = .mon, .restaurant = .ru1, .lunch = true },
+        .{ .weekday = .thu, .restaurant = .ru2, .coffee = true, .lunch = true },
+        .{ .weekday = .fri, .restaurant = .ru1, .coffee = true, .dinner = true },
+        .{ .weekday = .sun, .restaurant = .ru2, .coffee = true, .dinner = true },
     };
 
     try std.testing.expectEqual(Weekday.fri, targetWeekday(Weekday.thu, &schedules, true));
-}
-
-test "restaurant real number: one" {
-    try std.testing.expectEqual(1, restaurantRealNumber(1));
-}
-
-test "restaurant real number: two" {
-    try std.testing.expectEqual(41, restaurantRealNumber(2));
-}
-
-test "restaurant real number: any other" {
-    try std.testing.expectEqual(1, restaurantRealNumber(44));
 }
 
 test "parse student from arguments: username and password" {
@@ -689,4 +686,12 @@ test "parse student from arguments: username and password" {
 test "merge login: password only, no username anywhere" {
     const from_args = Login{ .password = "abc" };
     try std.testing.expectError(error.MissingUsername, parseEnvWithArgs(from_args, null, null));
+}
+
+test "restaurant api id: ru1" {
+    try std.testing.expectEqual(1, Restaurant.ru1.apiId());
+}
+
+test "restaurant api id: ru2" {
+    try std.testing.expectEqual(41, Restaurant.ru2.apiId());
 }
