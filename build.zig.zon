@@ -1,5 +1,5 @@
 .{
-    .name = .testes,
+    .name = .rutina,
     .version = "0.0.1",
     .minimum_zig_version = "0.18.0-dev.861+1a0778dc2",
     .paths = .{""},
